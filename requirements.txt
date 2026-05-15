@@ -1,0 +1,20 @@
+# Foundry hosted-agent SDK (BaseAgent adapter + Responses protocol server).
+azure-ai-agentserver-agentframework==1.0.0b16
+# Pin agent-framework to match the rc range agentserver-agentframework requires.
+agent-framework==1.0.0rc3
+
+# LangGraph multi-agent stack.
+# langgraph-supervisor is the canonical "supervisor of specialists" helper
+# from langchain-ai (https://github.com/langchain-ai/langgraph-supervisor-py).
+# langgraph-supervisor 0.0.31 requires langgraph>=1.0.2,<2.0 — pin compatibly.
+langgraph>=1.0.2,<2.0
+langgraph-supervisor==0.0.31
+langchain>=1.0.0,<2.0
+langchain-openai>=1.0.0,<2.0
+
+# Real web search tool for the research_expert agent (no API key required).
+duckduckgo-search==6.3.7
+
+# Foundry / Azure auth + env loading.
+azure-identity>=1.25.1
+python-dotenv
