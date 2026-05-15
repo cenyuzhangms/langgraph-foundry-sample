@@ -28,83 +28,122 @@ glue lives in [`main.py`](main.py), [`agent.yaml`](agent.yaml),
 
 ---
 
-## What changed vs the upstream `langgraph-supervisor` sample
+## What's required to run on Foundry Hosted Agents
 
-### 1. LLM binding — Azure OpenAI via Foundry-managed identity
+These are the **only** changes that matter for hosting; everything else
+(DuckDuckGo search, the extra `code_expert`, prompt tweaks, the two skills)
+is sample content, not a hosting requirement.
 
-| Upstream README | This sample |
-|---|---|
-| `ChatOpenAI(model="gpt-4o")` + `OPENAI_API_KEY` | `AzureChatOpenAI(azure_endpoint=…, azure_deployment=…, azure_ad_token_provider=…)` |
-| Public OpenAI | Foundry-deployed model (`MODEL_DEPLOYMENT_NAME`, default `gpt-4.1-mini`) |
-| API key | `DefaultAzureCredential` → bearer for `https://cognitiveservices.azure.com/.default` (uses the per-instance MI inside the container — **no secrets**) |
+### 1. Authenticate to the model with the container's managed identity (no API keys)
 
-`graph._derive_openai_endpoint()` resolves the Azure OpenAI endpoint from
-either `AZURE_OPENAI_ENDPOINT` or by parsing the Foundry `PROJECT_ENDPOINT`
-(`https://<acct>.services.ai.azure.com/...` → `https://<acct>.openai.azure.com`).
+The hosted-agent container has a per-instance managed identity. Use it
+instead of an API key when constructing the LLM client:
 
-### 2. Real `web_search` tool instead of the README stub
+```python
+from azure.identity import DefaultAzureCredential, get_bearer_token_provider
+from langchain_openai import AzureChatOpenAI
 
-Upstream returns a hard-coded string from `web_search`. This sample calls
-DuckDuckGo via the `duckduckgo-search` package and returns the top-5 hits
-with title / snippet / URL.
+token_provider = get_bearer_token_provider(
+    DefaultAzureCredential(), "https://cognitiveservices.azure.com/.default"
+)
+llm = AzureChatOpenAI(
+    azure_endpoint=os.environ["AZURE_OPENAI_ENDPOINT"],
+    azure_deployment=os.environ["MODEL_DEPLOYMENT_NAME"],
+    api_version="2024-10-21",
+    azure_ad_token_provider=token_provider,
+)
+```
 
-### 3. A third specialist + a sandboxed code tool
+The endpoint + deployment env vars are wired in by [`agent.yaml`](agent.yaml).
+The MI must hold the RBAC roles listed under "Deploy" below.
 
-Upstream has `research_expert` + `math_expert`. This sample adds:
+### 2. Wrap the compiled LangGraph app in a `BaseAgent` and serve it
 
-- `divide(a, b)` (with zero-guard) on `math_expert`
-- `code_expert` agent with a single `python_eval` tool — a Python
-  expression evaluator restricted by an **AST whitelist**: arithmetic,
-  comparisons, and a small set of builtins (`abs/min/max/sum/len/round/pow/sorted/range`).
-  No imports, no attribute access, no statements.
+[`main.py`](main.py) is the entire Foundry adapter. The pieces that *have*
+to be there:
 
-### 4. Stronger handoff prompts
+```python
+from agent_framework import (
+    AgentResponse, AgentResponseUpdate, BaseAgent,
+    Content, Message, ResponseStream,
+)
+from azure.ai.agentserver.agentframework import from_agent_framework
 
-Specialist prompts are explicit about *not* doing each other's job ("do NOT
-search the web — defer to research_expert by handing back to the supervisor").
-Upstream prompts are minimal.
+class LangGraphSupervisorAgent(BaseAgent):
+    def __init__(self):
+        super().__init__(name="...", description="...")
+        self._app = build_app()  # your compiled LangGraph
 
-### 5. Foundry adapter — `BaseAgent` wrapper around `app.invoke`
+    # IMPORTANT: regular def, not async def — the adapter calls
+    # run(stream=True) WITHOUT awaiting and iterates the result.
+    def run(self, messages=None, *, stream=False, thread=None, **kw):
+        if stream:
+            return ResponseStream(self._stream(messages), finalizer=self._finalize)
+        return self._run_once(messages)  # coroutine
 
-[`main.py`](main.py) defines `LangGraphSupervisorAgent(BaseAgent)`. On every
-turn it:
+    async def _run_once(self, messages):
+        text = await self._invoke_supervisor(messages)
+        return AgentResponse(messages=[Message("assistant", text=text)])
 
-1. Translates Foundry `Message`s ↔ LangChain `BaseMessage`s.
-2. Prepends a system-message appendix loaded from `./skills/*/SKILL.md`.
-3. Runs `await asyncio.to_thread(self._app.invoke, {"messages": lc_messages})`
-   (LangGraph compiled apps are sync; offload to keep the async server
-   responsive).
-4. Returns the final assistant text as an `AgentResponse` — or wraps a
-   one-update async generator in a `ResponseStream(…, finalizer=…)` for
-   streaming (the Playground requires `get_final_response()` on the stream
-   object; a bare async generator crashes it).
+    async def _stream(self, messages):
+        text = await self._invoke_supervisor(messages)
+        yield AgentResponseUpdate(
+            contents=[Content.from_text(text=text)], role="assistant"
+        )
 
-`from_agent_framework(agent).run()` then serves the Foundry Responses
-protocol on container port 8088.
+    @staticmethod
+    def _finalize(updates):
+        parts = [c.text for u in updates for c in (u.contents or []) if getattr(c,"text",None)]
+        return AgentResponse(messages=[Message("assistant", text="".join(parts))])
 
-### 6. Foundry Skills — system-prompt injection from local `SKILL.md` files
+    async def _invoke_supervisor(self, messages):
+        lc_messages = _to_lc_messages(messages)            # Foundry Message -> LangChain BaseMessage
+        result = await asyncio.to_thread(                  # LangGraph compiled app is sync
+            self._app.invoke, {"messages": lc_messages}
+        )
+        return result["messages"][-1].content              # final AIMessage text
 
-LangGraph itself has no notion of "skills". This sample adds two via the
-adapter, mirroring the `foundry-data-analyst-with-skills` pattern:
+if __name__ == "__main__":
+    from_agent_framework(LangGraphSupervisorAgent()).run()  # serves port 8088
+```
 
-| Skill | Type | Effect |
-|---|---|---|
-| `exec-summary` | MANDATORY policy (no `bin/`) | Forces every final answer to open with **TL;DR / Confidence / Recommended action**. |
-| `research-brief` | Playbook (with `bin/`) | Guidance for structuring multi-source research answers. |
+Three subtleties that bite:
 
-`load_skills_appendix()` reads each `skills/<name>/SKILL.md` at startup and
-buckets them into "MANDATORY policies" vs "Available playbooks" before
-prepending them to the system prompt seen by the supervisor LLM.
+- **`run` must be `def`, not `async def`.** Stream branch returns a
+  `ResponseStream`; non-stream branch returns a coroutine.
+- **Wrap the streaming generator in `ResponseStream(..., finalizer=...)`.**
+  A bare `async def`/`yield` works in the CLI but the Playground crashes
+  with `'async_generator' object has no attribute 'get_final_response'`.
+- **Bridge the sync `app.invoke` with `asyncio.to_thread`.** LangGraph
+  compiled apps are sync; the Foundry server is async.
 
-### 7. Container packaging
+### 3. Translate Foundry messages ↔ LangChain messages
 
-- [`Dockerfile`](Dockerfile) — `python:3.12-slim`, installs requirements,
-  copies source + `skills/` into `/opt/skills/<name>/`, runs `python main.py`.
+LangGraph speaks `langchain_core.messages.BaseMessage`; the Foundry adapter
+speaks `agent_framework.Message`. The translator in [`main.py`](main.py)
+maps roles (`system` → `SystemMessage`, `assistant` → `AIMessage`,
+`tool` → `ToolMessage`, anything else → `HumanMessage`) and concatenates
+text content parts.
+
+### 4. Container packaging
+
+- [`Dockerfile`](Dockerfile) — `python:3.12-slim`, `pip install -r requirements.txt`,
+  `CMD ["python", "main.py"]`. The container must listen on port **8088**
+  (handled by `from_agent_framework(...).run()`).
 - [`agent.yaml`](agent.yaml) — `kind: hosted`, `protocol: responses`, env
   vars (`PROJECT_ENDPOINT`, `AZURE_OPENAI_ENDPOINT`, `MODEL_DEPLOYMENT_NAME`).
 - [`azure.yaml`](azure.yaml) — `azd` service of host `azure.ai.agent`.
-- [`infra/main.bicep`](infra/main.bicep) — wires the per-agent MI to the
-  required RBAC roles (see below).
+
+### 5. Pinned SDK versions
+
+```
+agent-framework==1.0.0rc3
+azure-ai-agentserver-agentframework==1.0.0b16
+```
+
+The rc3 surface uses `AgentResponse` / `Message` / `Content` (NOT the older
+`AgentRunResponse` / `ChatMessage` / `TextContent` names). Mismatched
+versions surface as `agent_version_failed` with no clear error.
 
 ---
 
@@ -172,12 +211,3 @@ ran).
 
 - `What mandatory policies and playbooks are you operating under? List them by name.` — should name `exec-summary` and `research-brief`
 - `Just give me a one-line answer, no preamble: what's 2+2?` — `exec-summary` should still force the TL;DR header
-
----
-
-## Verified gotchas (from building this sample)
-
-- **`agent-framework==1.0.0rc3`** is what `azure-ai-agentserver-agentframework==1.0.0b16` requires. The rc3 surface uses `AgentResponse` / `Message` / `Content` (NOT the older `AgentRunResponse` / `ChatMessage` / `TextContent` names).
-- **`BaseAgent.run` must be a regular `def` (not `async def`).** The adapter calls `agent.run(stream=True)` *without* awaiting and iterates the result. For `stream=False` return a coroutine; for `stream=True` return a `ResponseStream` (wrapping your async generator with a `finalizer`) — a bare async generator works for the CLI but crashes the Playground with `'async_generator' object has no attribute 'get_final_response'`.
-- **Skills are loaded from local `SKILL.md` files at startup**, not from the Foundry runtime REST endpoint (which silently returns nothing from inside the container).
-- The role you need on the project scope is **`Foundry User`**, not `Azure AI User`.
