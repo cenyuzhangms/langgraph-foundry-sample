@@ -12,9 +12,6 @@ langgraph-supervisor==0.0.31
 langchain>=1.0.0,<2.0
 langchain-openai>=1.0.0,<2.0
 
-# Real web search tool for the research_expert agent (no API key required).
-duckduckgo-search==6.3.7
-
 # Foundry / Azure auth + env loading.
 azure-identity>=1.25.1
 python-dotenv

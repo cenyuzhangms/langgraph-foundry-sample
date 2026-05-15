@@ -1,38 +1,51 @@
 # LangGraph Supervisor on Microsoft Foundry Hosted Agents
 
-A working sample showing that the canonical [LangGraph
-`langgraph-supervisor`][lgsup] multi-agent pattern can be deployed to
-**Microsoft Foundry Hosted Agents** with a small adapter — no rewrite of the
-graph required.
+A working sample proving that an **unchanged** LangGraph
+[`langgraph-supervisor`][lgsup] multi-agent app can be deployed to
+**Microsoft Foundry Hosted Agents** with a thin adapter.
 
-The LangGraph code in [`graph.py`](graph.py) is functionally the same shape
-as the [upstream `langgraph-supervisor` README][lgsup-readme]. The Foundry
-glue lives in [`main.py`](main.py), [`agent.yaml`](agent.yaml),
-[`Dockerfile`](Dockerfile), [`azure.yaml`](azure.yaml), and
-[`infra/`](infra/).
+[`graph.py`](graph.py) is the [upstream `langgraph-supervisor` README
+quickstart][lgsup-readme] **copy-pasted verbatim**, with one line changed:
+the LLM is constructed via Foundry's container managed identity instead of
+an `OPENAI_API_KEY`. The Foundry glue is entirely in [`main.py`](main.py)
++ [`agent.yaml`](agent.yaml) + [`Dockerfile`](Dockerfile) +
+[`azure.yaml`](azure.yaml) + [`infra/`](infra/).
 
 [lgsup]: https://github.com/langchain-ai/langgraph-supervisor-py
-[lgsup-readme]: https://github.com/langchain-ai/langgraph-supervisor-py#example
+[lgsup-readme]: https://github.com/langchain-ai/langgraph-supervisor-py#quickstart
 
 ```
             ┌─────────────────┐
  user ───▶  │   supervisor    │ ◀── routes by task description
             └─────────────────┘
                     │
-        ┌───────────┼─────────────┐
-        ▼           ▼             ▼
- research_expert  math_expert  code_expert
-   (web_search)  (add/mul/div, (python_eval)
-                  python_eval)
+             ┌──────┴──────┐
+             ▼             ▼
+      research_expert   math_expert
+        (web_search)    (add, multiply)
+```
+
+The one-line diff vs upstream:
+
+```diff
+- from langchain_openai import ChatOpenAI
+- model = ChatOpenAI(model="gpt-4o")
++ from langchain_openai import AzureChatOpenAI
++ from azure.identity import DefaultAzureCredential, get_bearer_token_provider
++ model = AzureChatOpenAI(
++     azure_endpoint=..., azure_deployment=..., api_version="2024-10-21",
++     azure_ad_token_provider=get_bearer_token_provider(
++         DefaultAzureCredential(), "https://cognitiveservices.azure.com/.default"),
++ )
 ```
 
 ---
 
 ## What's required to run on Foundry Hosted Agents
 
-These are the **only** changes that matter for hosting; everything else
-(DuckDuckGo search, the extra `code_expert`, prompt tweaks, the two skills)
-is sample content, not a hosting requirement.
+These are the **only** changes that matter for hosting; the two skills
+shipped under `skills/` are an optional Foundry feature demo, not a
+hosting requirement.
 
 ### 1. Authenticate to the model with the container's managed identity (no API keys)
 
@@ -151,7 +164,7 @@ versions surface as `agent_version_failed` with no clear error.
 
 ```
 main.py                 # Foundry adapter: BaseAgent subclass + skill loader
-graph.py                # LangGraph supervisor + 3 specialists + tools (only LLM/tools differ from upstream)
+graph.py                # langgraph-supervisor README quickstart, verbatim except LLM
 agent.yaml              # Hosted-agent manifest
 azure.yaml              # azd service definition
 Dockerfile              # python:3.12-slim + skills/ baked into /opt/skills/
@@ -188,14 +201,17 @@ Without `Foundry User` on the project scope, invocations return
 
 ## Smoke test
 
+The upstream README's example query:
+
 ```powershell
-azd ai agent invoke "What is (12 * 7) + 100, and briefly tell me what LangGraph is?"
+azd ai agent invoke "what's the combined headcount of the FAANG companies in 2024?"
 ```
 
 Expected: a TL;DR / Confidence / Recommended-action header (proves the
-`exec-summary` skill applied), the math result `184` (proves `math_expert`
-ran), and a one-paragraph LangGraph description (proves `research_expert`
-ran).
+`exec-summary` skill applied on top of the unchanged LangGraph code), then
+the FAANG breakdown from `research_expert`'s `web_search` tool, then the
+total `1,977,586` from `math_expert`'s `add` tool — exactly the supervisor
+handoff the upstream README demonstrates.
 
 ---
 
@@ -203,11 +219,10 @@ ran).
 
 **Tools**
 
-- `What is (12 * 7) + 100, then divided by 4?` — math_expert chain
-- `Use Python to compute the sum of squares from 1 to 50.` — code_expert / python_eval
-- `Search for the current population of Tokyo, then divide it by 1000 to get it in thousands.` — research + math handoff
+- `what's the combined headcount of the FAANG companies in 2024?` — research → math handoff (the upstream README example)
+- `What is (12 * 7) + 100?` — math_expert only
 
-**Skills**
+**Skills** (optional Foundry feature, layered on without touching `graph.py`)
 
 - `What mandatory policies and playbooks are you operating under? List them by name.` — should name `exec-summary` and `research-brief`
 - `Just give me a one-line answer, no preamble: what's 2+2?` — `exec-summary` should still force the TL;DR header
