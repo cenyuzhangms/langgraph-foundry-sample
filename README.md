@@ -72,8 +72,7 @@ The MI must hold the RBAC roles listed under "Deploy" below.
 
 ### 2. Wrap the compiled LangGraph app in a `BaseAgent` and serve it
 
-[`main.py`](main.py) is the entire Foundry adapter. The pieces that *have*
-to be there:
+[`main.py`](main.py) is the entire Foundry adapter — ~50 lines:
 
 ```python
 from agent_framework import (
@@ -81,40 +80,50 @@ from agent_framework import (
     Content, Message, ResponseStream,
 )
 from azure.ai.agentserver.agentframework import from_agent_framework
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from graph import build_app
+
+_ROLE_MAP = {"system": SystemMessage, "assistant": AIMessage}
+
+def _to_lc(messages):
+    """agent_framework Message(s) -> langchain BaseMessage(s)."""
+    if messages is None: return []
+    if isinstance(messages, (str, Message)): messages = [messages]
+    out = []
+    for m in messages:
+        if isinstance(m, str):
+            out.append(HumanMessage(content=m)); continue
+        text = getattr(m, "text", None) or "\n".join(
+            getattr(c, "text", "") for c in (getattr(m, "contents", None) or []))
+        cls = _ROLE_MAP.get(str(getattr(m, "role", "")).lower(), HumanMessage)
+        out.append(cls(content=text))
+    return out
 
 class LangGraphSupervisorAgent(BaseAgent):
     def __init__(self):
-        super().__init__(name="...", description="...")
-        self._app = build_app()  # your compiled LangGraph
+        super().__init__(name="LangGraphSupervisorAgent", description="...")
+        self._app = build_app()
 
-    # IMPORTANT: regular def, not async def — the adapter calls
-    # run(stream=True) WITHOUT awaiting and iterates the result.
-    def run(self, messages=None, *, stream=False, thread=None, **kw):
+    # `run` MUST be a regular def: adapter calls run(stream=True) without awaiting.
+    def run(self, messages=None, *, stream=False, **_):
         if stream:
             return ResponseStream(self._stream(messages), finalizer=self._finalize)
-        return self._run_once(messages)  # coroutine
+        return self._invoke(messages)
 
-    async def _run_once(self, messages):
-        text = await self._invoke_supervisor(messages)
-        return AgentResponse(messages=[Message("assistant", text=text)])
+    async def _invoke(self, messages):
+        result = await asyncio.to_thread(self._app.invoke, {"messages": _to_lc(messages)})
+        return AgentResponse(messages=[Message("assistant", text=result["messages"][-1].content)])
 
     async def _stream(self, messages):
-        text = await self._invoke_supervisor(messages)
+        resp = await self._invoke(messages)
         yield AgentResponseUpdate(
-            contents=[Content.from_text(text=text)], role="assistant"
-        )
+            contents=[Content.from_text(text=resp.messages[0].text)], role="assistant")
 
     @staticmethod
     def _finalize(updates):
-        parts = [c.text for u in updates for c in (u.contents or []) if getattr(c,"text",None)]
-        return AgentResponse(messages=[Message("assistant", text="".join(parts))])
-
-    async def _invoke_supervisor(self, messages):
-        lc_messages = _to_lc_messages(messages)            # Foundry Message -> LangChain BaseMessage
-        result = await asyncio.to_thread(                  # LangGraph compiled app is sync
-            self._app.invoke, {"messages": lc_messages}
-        )
-        return result["messages"][-1].content              # final AIMessage text
+        text = "".join(c.text for u in updates for c in (u.contents or [])
+                       if getattr(c, "text", None))
+        return AgentResponse(messages=[Message("assistant", text=text)])
 
 if __name__ == "__main__":
     from_agent_framework(LangGraphSupervisorAgent()).run()  # serves port 8088
@@ -133,10 +142,9 @@ Three subtleties that bite:
 ### 3. Translate Foundry messages ↔ LangChain messages
 
 LangGraph speaks `langchain_core.messages.BaseMessage`; the Foundry adapter
-speaks `agent_framework.Message`. The translator in [`main.py`](main.py)
-maps roles (`system` → `SystemMessage`, `assistant` → `AIMessage`,
-`tool` → `ToolMessage`, anything else → `HumanMessage`) and concatenates
-text content parts.
+speaks `agent_framework.Message`. The `_to_lc` helper above maps roles
+(`system` → `SystemMessage`, `assistant` → `AIMessage`, anything else →
+`HumanMessage`) and concatenates text content parts.
 
 ### 4. Container packaging
 
@@ -163,16 +171,12 @@ versions surface as `agent_version_failed` with no clear error.
 ## Layout
 
 ```
-main.py                 # Foundry adapter: BaseAgent subclass + skill loader
+main.py                 # Foundry adapter (~50 lines): BaseAgent subclass + msg translator
 graph.py                # langgraph-supervisor README quickstart, verbatim except LLM
 agent.yaml              # Hosted-agent manifest
 azure.yaml              # azd service definition
-Dockerfile              # python:3.12-slim + skills/ baked into /opt/skills/
+Dockerfile              # python:3.12-slim + pip install -r requirements.txt
 requirements.txt        # langgraph, langgraph-supervisor, langchain-openai, agent-framework, ...
-skills/
-  exec-summary/SKILL.md             # prose-only mandatory policy
-  research-brief/SKILL.md           # playbook description
-  research-brief/bin/research-brief # placeholder executable on $PATH
 infra/                  # Bicep
 ```
 
@@ -207,22 +211,13 @@ The upstream README's example query:
 azd ai agent invoke "what's the combined headcount of the FAANG companies in 2024?"
 ```
 
-Expected: a TL;DR / Confidence / Recommended-action header (proves the
-`exec-summary` skill applied on top of the unchanged LangGraph code), then
-the FAANG breakdown from `research_expert`'s `web_search` tool, then the
-total `1,977,586` from `math_expert`'s `add` tool — exactly the supervisor
-handoff the upstream README demonstrates.
+Expected: the FAANG breakdown from `research_expert`'s `web_search` tool
+plus the total `1,977,586` from `math_expert`'s `add` tool — exactly the
+supervisor handoff the upstream README demonstrates.
 
 ---
 
 ## Try these prompts in the Playground
 
-**Tools**
-
 - `what's the combined headcount of the FAANG companies in 2024?` — research → math handoff (the upstream README example)
 - `What is (12 * 7) + 100?` — math_expert only
-
-**Skills** (optional Foundry feature, layered on without touching `graph.py`)
-
-- `What mandatory policies and playbooks are you operating under? List them by name.` — should name `exec-summary` and `research-brief`
-- `Just give me a one-line answer, no preamble: what's 2+2?` — `exec-summary` should still force the TL;DR header
